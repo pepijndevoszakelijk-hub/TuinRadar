@@ -1,7 +1,7 @@
 export type PlantAdvice = {
   foto: string;
   waarschijnlijke_plant: string;
-  zekerheid: "laag" | "middel" | "hoog";
+  zekerheid: "laag" | "middel" | "hoog" | "zelf" | "onzeker";
   gezondheid: string;
   water: string;
   snoei: string;
@@ -82,6 +82,7 @@ export type GardenAdvice = {
       nabijheid: string;
       kaartUrl?: string;
     };
+    tuinDna?: string[];
   };
 };
 

@@ -20,6 +20,14 @@ type PlantSelection = {
   score?: number;
 };
 
+type GardenProfile = {
+  gardenType: string;
+  sunProfile: string;
+  greenLevel: string;
+  goal: string;
+  maintenance: string;
+};
+
 type PlantRule = {
   health: string;
   water: string;
@@ -224,48 +232,52 @@ const plantRules: Record<string, PlantRule> = {
 };
 
 export async function POST(request: Request) {
-  const formData = await request.formData();
-  const address = buildAddress(formData);
-  const goal = String(formData.get("goal") || "biodivers");
-  const maintenance = String(formData.get("maintenance") || "gemiddeld");
-  const overviewFiles = formData.getAll("overviewPhotos").filter(isFile).slice(0, 2);
-  const plantFiles = formData.getAll("plantPhotos").filter(isFile).slice(0, 7);
-  const plantSelections = parsePlantSelections(String(formData.get("plantSelections") || "[]"));
+  try {
+    const formData = await request.formData();
+    const address = buildAddress(formData);
+    const profile = readGardenProfile(formData);
+    const plantFiles = formData.getAll("plantPhotos").filter(isFile).slice(0, 7);
+    const plantSelections = parsePlantSelections(String(formData.get("plantSelections") || "[]"));
 
-  if (!address) {
-    return NextResponse.json({ error: "Straat, huisnummer, postcode en plaats zijn verplicht." }, { status: 400 });
-  }
-
-  if (overviewFiles.length < 1 || plantFiles.length < 4) {
-    return NextResponse.json({ error: "Upload minimaal 1 overzichtsfoto en minimaal 4 plantfoto's." }, { status: 400 });
-  }
-
-  const location = await geocodeAddress(address);
-  const weather = location ? await fetchWeather(location.lat, location.lon) : null;
-  const advice = createRuleBasedAdvice({
-    goal,
-    maintenance,
-    weather,
-    plantCount: plantFiles.length,
-    plantSelections,
-    location
-  });
-
-  const response: AnalyzeResponse = {
-    ...advice,
-    locatie: {
-      adres: location?.label || address,
-      lat: location?.lat,
-      lon: location?.lon
-    },
-    bronnen: {
-      pdok: Boolean(location),
-      openMeteo: Boolean(weather),
-      advies: true
+    if (!address) {
+      return NextResponse.json({ error: "Straat, huisnummer, postcode en plaats zijn verplicht." }, { status: 400 });
     }
-  };
 
-  return NextResponse.json(response);
+    if (plantFiles.length < 4) {
+      return NextResponse.json({ error: "Upload minimaal 4 plantfoto's." }, { status: 400 });
+    }
+
+    const location = await geocodeAddress(address);
+    const weather = location ? await fetchWeather(location.lat, location.lon) : null;
+    const advice = createRuleBasedAdvice({
+      profile,
+      weather,
+      plantCount: plantFiles.length,
+      plantSelections,
+      location
+    });
+
+    const response: AnalyzeResponse = {
+      ...advice,
+      locatie: {
+        adres: location?.label || address,
+        lat: location?.lat,
+        lon: location?.lon
+      },
+      bronnen: {
+        pdok: Boolean(location),
+        openMeteo: Boolean(weather),
+        advies: true
+      }
+    };
+
+    return NextResponse.json(response);
+  } catch {
+    return NextResponse.json(
+      { error: "Je tuinadvies kon niet worden samengesteld. Probeer het later opnieuw." },
+      { status: 500 }
+    );
+  }
 }
 
 function buildAddress(formData: FormData) {
@@ -275,6 +287,17 @@ function buildAddress(formData: FormData) {
   const city = String(formData.get("city") || "").trim();
   if (!street || !houseNumber || !postcode || !city) return "";
   return `${street} ${houseNumber}, ${postcode} ${city}`;
+}
+
+function readGardenProfile(formData: FormData): GardenProfile {
+  const goal = String(formData.get("goal") || "Meer biodiversiteit");
+  return {
+    gardenType: String(formData.get("gardenType") || "Compacte stadstuin"),
+    sunProfile: String(formData.get("sunProfile") || "Gemengd"),
+    greenLevel: String(formData.get("greenLevel") || "Gemengd"),
+    goal,
+    maintenance: String(formData.get("maintenance") || "gemiddeld")
+  };
 }
 
 function isFile(value: FormDataEntryValue): value is File {
@@ -342,8 +365,7 @@ async function fetchWeather(lat: number, lon: number): Promise<WeatherSummary | 
 }
 
 function createRuleBasedAdvice(input: {
-  goal: string;
-  maintenance: string;
+  profile: GardenProfile;
   weather: WeatherSummary | null;
   plantCount: number;
   plantSelections: PlantSelection[];
@@ -356,19 +378,19 @@ function createRuleBasedAdvice(input: {
     const selection = input.plantSelections[index];
     const basePlant = normalizePlantName(selection?.plant || "Nog niet zeker herkend");
     const plantName = basePlant === "Nog niet zeker herkend" && selection?.customName ? selection.customName : basePlant;
-    return { basePlant, plantName, score: selection?.score };
+    return { basePlant, plantName, score: selection?.score, isCustom: basePlant === "Nog niet zeker herkend" && Boolean(selection?.customName) };
   });
   const plants = selectedPlants.map((plant, index) =>
-    createPlantAdvice(index, plant.plantName, plant.basePlant, plant.score, season, weatherProfile, input.goal, input.maintenance)
+    createPlantAdvice(index, plant.plantName, plant.basePlant, plant.score, plant.isCustom, season, weatherProfile, input.profile.goal, input.profile.maintenance)
   );
 
-  const priorities = createPriorities(plants, weatherProfile, input.goal, input.maintenance);
+  const priorities = createPriorities(plants, weatherProfile, input.profile);
 
   return addScore({
     tuinprofiel: {
-      samenvatting: `Slimme analyse op basis van ${plants.length} bevestigde plantkeuze${plants.length === 1 ? "" : "s"}, je wens "${input.goal}" en onderhoudsniveau "${input.maintenance}".`,
-      ligging_inschatting: "De locatie is via PDOK gekoppeld aan de weersverwachting; gebruik je overzichtsfoto's om zon- en schaduwplekken zelf te finetunen.",
-      zon_schaduw: createSunShadeAdvice(input.goal, input.maintenance),
+      samenvatting: createProfileSummary(input.profile, selectedPlants, weatherProfile),
+      ligging_inschatting: createLocationProfile(input.profile, input.location),
+      zon_schaduw: createSunShadeAdvice(input.profile),
       risico: weatherProfile.warning
     },
     weeradvies: {
@@ -378,10 +400,23 @@ function createRuleBasedAdvice(input: {
     },
     planten: plants,
     prioriteiten: priorities,
-    maandadvies: createMonthlyAdvice(season, input.goal, input.maintenance, weatherProfile),
-    wow_samenvatting: createSmartInsight(plants, weatherProfile, input.goal, input.maintenance),
-    demo: createDemoCards(selectedPlants, plants, month, weatherProfile, input.goal, input.maintenance, input.location)
+    maandadvies: createMonthlyAdvice(season, input.profile, weatherProfile),
+    wow_samenvatting: createSmartInsight(plants, weatherProfile, input.profile),
+    demo: createDemoCards(selectedPlants, plants, month, weatherProfile, input.profile, input.location)
   });
+}
+
+function createProfileSummary(profile: GardenProfile, selectedPlants: Array<{ basePlant: string; plantName: string }>, weather: ReturnType<typeof getWeatherProfile>) {
+  const knownCount = selectedPlants.filter((plant) => plant.basePlant !== "Nog niet zeker herkend").length;
+  const dryText = getProfileDryness(profile, weather) === "hoog" ? "droogtegevoelige" : getProfileDryness(profile, weather) === "gemiddeld" ? "gemiddeld droge" : "relatief rustige";
+  return `${profile.gardenType} met ${profile.sunProfile.toLowerCase()} en ${profile.greenLevel.toLowerCase()}. Deze maand vraagt dit om ${dryText} verzorging rond ${knownCount || selectedPlants.length} planten.`;
+}
+
+function createLocationProfile(profile: GardenProfile, location: { label: string; lat: number; lon: number } | null) {
+  const setting = location && isLikelyUrban(location.label) ? "stedelijke ligging" : "woongebied met tuinkarakter";
+  if (profile.greenLevel === "Veel bestrating") return `${setting}; verharding warmt sneller op en vraagt scherpere watercontrole.`;
+  if (profile.greenLevel === "Vooral groen") return `${setting}; veel groen dempt warmte en houdt de bodem langer actief.`;
+  return `${setting}; een mix van groen en verharding geeft ruimte voor gerichte accenten.`;
 }
 
 function createPlantAdvice(
@@ -389,6 +424,7 @@ function createPlantAdvice(
   plantName: string,
   basePlant: string,
   score: number | undefined,
+  isCustom: boolean,
   season: string,
   weather: ReturnType<typeof getWeatherProfile>,
   goal: string,
@@ -396,24 +432,27 @@ function createPlantAdvice(
 ): PlantAdvice {
   const rule = plantRules[basePlant] || plantRules["Nog niet zeker herkend"];
   const heatExtra = weather.isHotDry ? " Controleer op warme middagen of het blad slap hangt." : "";
-  const goalExtra = goal === "biodivers" ? " Laat een deel van bloemen en zaadhoofden staan." : goal === "strak" ? " Houd randen compact voor rust in het beeld." : "";
+  const goalExtra = goal === "Meer biodiversiteit" ? " Laat een deel van bloemen en zaadhoofden staan." : goal === "Strakkere uitstraling" ? " Houd randen compact voor rust in het beeld." : "";
   const maintenanceExtra = maintenance === "laag" ? " Bundel dit in een korte wekelijkse ronde." : maintenance === "hoog" ? " Volg bladkleur en vocht vaker op." : "";
 
   return {
     foto: `Plant ${index + 1}`,
     waarschijnlijke_plant: plantName,
-    zekerheid: getConfidence(score, basePlant),
+    zekerheid: getConfidence(score, basePlant, isCustom),
     gezondheid: `${rule.health}${heatExtra}`,
     water: `${rule.water} ${weather.plantWaterSuffix}`.trim(),
     snoei: rule.prune[season],
     actie_deze_maand: `${rule.action[season]}${goalExtra}${maintenanceExtra}`,
-    opmerking: rule.note
+    opmerking: isCustom || basePlant === "Nog niet zeker herkend"
+      ? "Controleer de plantnaam voor specifieker advies."
+      : rule.note
   };
 }
 
-function getConfidence(score: number | undefined, basePlant: string): "laag" | "middel" | "hoog" {
-  if (basePlant === "Nog niet zeker herkend") return "laag";
-  if (typeof score !== "number") return "hoog";
+function getConfidence(score: number | undefined, basePlant: string, isCustom: boolean): PlantAdvice["zekerheid"] {
+  if (isCustom) return "zelf";
+  if (basePlant === "Nog niet zeker herkend") return "onzeker";
+  if (typeof score !== "number") return "zelf";
   if (score >= 0.55) return "hoog";
   if (score >= 0.25) return "middel";
   return "laag";
@@ -485,49 +524,60 @@ function createWaterAdvice(rain: number, maxTemp: number, dryRisk: string, isWet
   return `Normale week: meestal volstaat controleren. Geef alleen water als de bodem droog aanvoelt.`;
 }
 
-function createPriorities(plants: PlantAdvice[], weather: ReturnType<typeof getWeatherProfile>, goal: string, maintenance: string) {
+function createPriorities(plants: PlantAdvice[], weather: ReturnType<typeof getWeatherProfile>, profile: GardenProfile) {
   const first = weather.isHotDry
     ? "Zet watercontrole bovenaan: potten, jonge planten en groot blad eerst."
     : weather.isWet
       ? "Controleer afwatering en haal ziek of nat blad uit dicht plantwerk."
-      : "Loop de tuin eenmaal rustig na en noteer droge plekken, onkruid en uitgebloeide bloemen.";
-  const second = goal === "strak" || goal === "luxe uitstraling"
+      : profile.greenLevel === "Veel bestrating"
+        ? "Controleer droge randen langs tegels; daar loopt water snel weg."
+        : "Loop de tuin eenmaal rustig na en noteer droge plekken, onkruid en uitgebloeide bloemen.";
+  const second = profile.goal === "Strakkere uitstraling"
     ? "Werk zichtlijnen, hagen en randen bij voor direct meer rust en kwaliteit."
-    : goal === "biodivers"
+    : profile.goal === "Meer biodiversiteit"
       ? "Laat bloeiende planten en zaadhoofden deels staan voor bestuivers."
-      : "Versterk kleur en bloei door uitgebloeide bloemen gericht weg te knippen.";
-  const third = maintenance === "laag"
+      : profile.goal === "Mediterrane uitstraling"
+        ? "Geef zonminnende planten lucht en houd de bodem liever droog dan nat."
+        : "Versterk kleur en bloei door uitgebloeide bloemen gericht weg te knippen.";
+  const third = profile.maintenance === "laag"
     ? "Bundel onderhoud in een vast wekelijks kwartier: water, onkruid, snoei alleen waar nodig."
     : `Pak deze maand vooral ${plants[0]?.waarschijnlijke_plant || "de belangrijkste plant"} aan als eerste zichtbare verbetering.`;
   return [first, second, third];
 }
 
-function createSunShadeAdvice(goal: string, maintenance: string) {
-  if (goal === "onderhoudsarm") return "Zet dorstige blikvangers liever in halfschaduw en kies zonnige plekken voor droogtetolerante planten.";
-  if (goal === "kleurrijk") return "Combineer zonminnende bloeiers met halfschaduwplanten zodat kleur niet op een plek geconcentreerd blijft.";
-  if (goal === "biodivers") return "Zonplekken zijn waardevol voor bloemen en insecten; schaduwplekken kunnen koeler en vochtiger blijven.";
-  if (goal === "strak") return `Houd zon- en schaduwzones visueel rustig; bij onderhoudsniveau ${maintenance} passen duidelijke plantvakken.`;
-  return "Gebruik zonplekken voor rijke bloei en halfschaduw voor groot blad, diepte en een luxere uitstraling.";
+function createSunShadeAdvice(profile: GardenProfile) {
+  if (profile.sunProfile === "Veel schaduw") return "Kies rustige bladplanten en geef minder vaak water; schaduw houdt de bodem langer koel.";
+  if (profile.sunProfile === "Vooral middagzon") return "Middagzon maakt water in de ochtend belangrijker, zeker langs tegels en muren.";
+  if (profile.goal === "Meer biodiversiteit") return "Zonplekken zijn waardevol voor bloemen en bestuivers; laat bloei daar langer staan.";
+  if (profile.goal === "Mediterrane uitstraling") return "Zonnige, drogere plekken passen goed bij lavendel, siergras en luchtige beplanting.";
+  return "Gebruik zonplekken voor bloei en halfschaduw voor rust, bladvolume en koelte.";
 }
 
-function createMonthlyAdvice(season: string, goal: string, maintenance: string, weather: ReturnType<typeof getWeatherProfile>) {
+function createMonthlyAdvice(season: string, profile: GardenProfile, weather: ReturnType<typeof getWeatherProfile>) {
   const base = {
     lente: "Geef planten nu lucht en voeding; nieuwe groei reageert snel.",
     zomer: "Houd bloei fris met gericht water en lichte snoei.",
     herfst: "Ruim ziek blad op en laat sterke structuur staan.",
     winter: "Laat de tuin grotendeels rusten en bescherm potten."
   }[season];
-  return `${base} Kies vooral acties die passen bij "${goal}" en onderhoud "${maintenance}". ${weather.warning}`;
+  const context = profile.greenLevel === "Veel bestrating"
+    ? "Randen langs bestrating drogen het eerst uit."
+    : profile.sunProfile === "Veel schaduw"
+      ? "In schaduw telt luchtigheid vaak meer dan extra water."
+      : `Richt je vooral op ${profile.goal.toLowerCase()}.`;
+  return `${base} ${context} ${weather.warning}`;
 }
 
-function createSmartInsight(plants: PlantAdvice[], weather: ReturnType<typeof getWeatherProfile>, goal: string, maintenance: string) {
+function createSmartInsight(plants: PlantAdvice[], weather: ReturnType<typeof getWeatherProfile>, profile: GardenProfile) {
   const plantNames = plants.map((plant) => plant.waarschijnlijke_plant).slice(0, 3).join(", ");
   const weatherPart = weather.isHotDry
     ? "Ochtendwater werkt deze week beter dan laat op de dag gieten."
     : weather.isWet
       ? "Meer lucht tussen planten is nu waardevoller dan extra water."
-      : "Het weer geeft ruimte om bloei, vorm en bodem rustig bij te sturen.";
-  return `${plantNames || "Je planten"} passen bij "${goal}". Met onderhoud "${maintenance}" is dit een realistische maandaanpak. ${weatherPart}`;
+      : profile.greenLevel === "Veel bestrating"
+        ? "De warme randen langs tegels verdienen een extra vochtcheck."
+        : "Het weer geeft ruimte om bloei, vorm en bodem rustig bij te sturen.";
+  return `${plantNames || "Je planten"} passen bij je wens: ${profile.goal.toLowerCase()}. ${weatherPart}`;
 }
 
 function createDemoCards(
@@ -535,16 +585,16 @@ function createDemoCards(
   plants: PlantAdvice[],
   month: number,
   weather: ReturnType<typeof getWeatherProfile>,
-  goal: string,
-  maintenance: string,
+  profile: GardenProfile,
   location: { label: string; lat: number; lon: number } | null
 ) {
   const knownPlants = selectedPlants.filter((plant) => plant.basePlant !== "Nog niet zeker herkend");
   const plantOfMonth = choosePlantOfMonth(selectedPlants, month, weather);
-  const biodiversityScore = calculateBiodiversityScore(selectedPlants, goal);
+  const biodiversityScore = calculateBiodiversityScore(selectedPlants, profile.goal);
   const bloomSoon = getBloomSoon(selectedPlants, month);
-  const waterLevel: "laag" | "normaal" | "druk" = weather.isHotDry ? "druk" : weather.isWet ? "laag" : weather.isDry ? "normaal" : "laag";
-  const trend: "stijgend" | "stabiel" | "dalend" = weather.isHotDry && maintenance === "laag" ? "dalend" : knownPlants.length >= 3 || goal === "biodivers" ? "stijgend" : "stabiel";
+  const drought = getProfileDryness(profile, weather);
+  const waterLevel: "laag" | "normaal" | "druk" = drought === "hoog" ? "druk" : weather.isWet || profile.sunProfile === "Veel schaduw" ? "laag" : "normaal";
+  const trend: "stijgend" | "stabiel" | "dalend" = drought === "hoog" && profile.maintenance === "laag" ? "dalend" : knownPlants.length >= 3 || profile.goal === "Meer biodiversiteit" ? "stijgend" : "stabiel";
 
   return {
     tuinweer: {
@@ -557,7 +607,7 @@ function createDemoCards(
     },
     tuinscoreTrend: {
       richting: trend,
-      tekst: trend === "stijgend" ? "Goede mix: score kan snel omhoog." : trend === "dalend" ? "Droogte drukt de score." : "Stabiel met klein onderhoud."
+      tekst: trend === "stijgend" ? "Je profiel en planten geven groeiruimte." : trend === "dalend" ? "Droogte vraagt deze week aandacht." : "Stabiel met rustig onderhoud."
     },
     waterdrukte: {
       niveau: waterLevel,
@@ -568,11 +618,12 @@ function createDemoCards(
       score: biodiversityScore,
       tekst: biodiversityScore >= 75 ? "Sterk voor insecten." : biodiversityScore >= 50 ? "Redelijke basis." : "Voeg bloeiers toe."
     },
-    liggingInschatting: createPositionEstimate(goal, selectedPlants, weather),
-    slimmeAnalyse: createShortSmartAnalysis(selectedPlants, weather, goal, maintenance),
-    droogtestress: createDroughtStress(weather),
-    waterPerDag: createDailyWaterAdvice(selectedPlants, weather, goal),
-    omgeving: createEnvironmentContext(location, selectedPlants, goal)
+    liggingInschatting: createPositionEstimate(profile, selectedPlants, weather),
+    slimmeAnalyse: createShortSmartAnalysis(selectedPlants, weather, profile),
+    droogtestress: createDroughtStress(weather, profile),
+    waterPerDag: createDailyWaterAdvice(selectedPlants, weather, profile),
+    omgeving: createEnvironmentContext(location, selectedPlants, profile),
+    tuinDna: createGardenDna(profile, selectedPlants, weather, biodiversityScore, bloomSoon)
   };
 }
 
@@ -589,7 +640,7 @@ function calculateBiodiversityScore(selectedPlants: Array<{ basePlant: string; p
   const total = selectedPlants.reduce((score, plant) => score + (plantRules[plant.basePlant]?.biodiversity || 2), 0);
   const average = selectedPlants.length ? total / selectedPlants.length : 2;
   const diversityBonus = Math.min(new Set(selectedPlants.map((plant) => plant.basePlant)).size * 5, 20);
-  const goalBonus = goal === "biodivers" ? 10 : 0;
+  const goalBonus = goal === "Meer biodiversiteit" ? 10 : 0;
   return Math.max(20, Math.min(95, Math.round(average * 14 + diversityBonus + goalBonus)));
 }
 
@@ -601,23 +652,31 @@ function getBloomSoon(selectedPlants: Array<{ basePlant: string; plantName: stri
   return plants.length ? Array.from(new Set(plants)).slice(0, 4) : ["Nog geen duidelijke bloeiers"];
 }
 
-function createPositionEstimate(goal: string, selectedPlants: Array<{ basePlant: string; plantName: string }>, weather: ReturnType<typeof getWeatherProfile>) {
+function createPositionEstimate(profile: GardenProfile, selectedPlants: Array<{ basePlant: string; plantName: string }>, weather: ReturnType<typeof getWeatherProfile>) {
   const hasSunLovers = selectedPlants.some((plant) => ["Lavendel", "Roos", "Siergras"].includes(plant.basePlant));
   const hasMoistureLovers = selectedPlants.some((plant) => ["Hortensia", "Olifantsoor"].includes(plant.basePlant));
-  if (hasSunLovers && hasMoistureLovers) return "Waarschijnlijk mix van zon en halfschaduw.";
+  if (profile.sunProfile === "Veel schaduw") return "Schaduwrijke tuin; koeler en minder snel droog.";
+  if (profile.greenLevel === "Veel bestrating") return weather.isHotDry ? "Warme, verharde randen drogen snel uit." : "Verharding geeft warmte en vraagt gerichte watercontrole.";
+  if (hasSunLovers && hasMoistureLovers) return "Mix van zon en halfschaduw past bij deze planten.";
   if (hasSunLovers) return weather.isHotDry ? "Zonnig beeld; let op uitdroging." : "Veel zonminnende beplanting.";
   if (hasMoistureLovers) return "Half schaduw of vochtige plek logisch.";
-  if (goal === "strak") return "Ligging lijkt geschikt voor duidelijke vakken.";
-  return "Gebruik de overzichtsfoto's om zon en schaduw verder te beoordelen.";
+  if (profile.goal === "Strakkere uitstraling") return "Geschikt voor duidelijke vakken en rustige lijnen.";
+  return "Je profiel wijst op een gemengde tuin met ruimte voor seizoensaccenten.";
 }
 
-function createShortSmartAnalysis(selectedPlants: Array<{ basePlant: string; plantName: string }>, weather: ReturnType<typeof getWeatherProfile>, goal: string, maintenance: string) {
+function createShortSmartAnalysis(selectedPlants: Array<{ basePlant: string; plantName: string }>, weather: ReturnType<typeof getWeatherProfile>, profile: GardenProfile) {
   const names = selectedPlants.map((plant) => plant.plantName).slice(0, 3).join(", ");
-  const action = weather.isHotDry ? "zet water in de ochtend bovenaan" : weather.isWet ? "houd blad en bodem luchtig" : "focus op bloei en vorm";
-  return `${names || "Je planten"} geven de tuin richting "${goal}". Deze week: ${action}.`;
+  const action = weather.isHotDry
+    ? "zet water in de ochtend bovenaan"
+    : weather.isWet
+      ? "houd blad en bodem luchtig"
+      : profile.goal === "Meer biodiversiteit"
+        ? "laat bloei en schuilplekken bewust staan"
+        : "focus op bloei en vorm";
+  return `${names || "Je planten"} geven richting aan ${profile.goal.toLowerCase()}. Deze week: ${action}.`;
 }
 
-function createDroughtStress(weather: ReturnType<typeof getWeatherProfile>) {
+function createDroughtStress(weather: ReturnType<typeof getWeatherProfile>, profile: GardenProfile) {
   let score = 0;
   if (weather.maxTemp >= 28) score += 2;
   else if (weather.maxTemp >= 23) score += 1;
@@ -626,19 +685,22 @@ function createDroughtStress(weather: ReturnType<typeof getWeatherProfile>) {
   if (weather.evaporation > weather.rain + 10) score += 2;
   else if (weather.evaporation > weather.rain + 4) score += 1;
   if (weather.isSunny) score += 1;
+  if (profile.greenLevel === "Veel bestrating") score += 1;
+  if (profile.sunProfile === "Vooral middagzon") score += 1;
+  if (profile.sunProfile === "Veel schaduw") score -= 1;
 
   const niveau: "laag" | "gemiddeld" | "hoog" = score >= 5 ? "hoog" : score >= 3 ? "gemiddeld" : "laag";
   return {
     niveau,
     uitleg: niveau === "hoog"
-      ? "Warm, droog en zonnig: potten en jonge planten snel controleren."
+      ? "Warmte, weinig regen of verharding maken snelle controle belangrijk."
       : niveau === "gemiddeld"
         ? "Er is wat droogtedruk; controleer dorstige planten om de dag."
         : "Regen en temperatuur houden droogtestress beperkt."
   };
 }
 
-function createDailyWaterAdvice(selectedPlants: Array<{ basePlant: string; plantName: string }>, weather: ReturnType<typeof getWeatherProfile>, goal: string) {
+function createDailyWaterAdvice(selectedPlants: Array<{ basePlant: string; plantName: string }>, weather: ReturnType<typeof getWeatherProfile>, profile: GardenProfile) {
   const thirstyPlants = selectedPlants.filter((plant) => ["Hortensia", "Olifantsoor", "Roos", "Geranium"].includes(plant.basePlant)).length;
   const daily = weather.daily;
   if (!daily.length) {
@@ -657,7 +719,9 @@ function createDailyWaterAdvice(selectedPlants: Array<{ basePlant: string; plant
     else if (day.rain < 4) pressure += 1;
     if (day.radiation >= 18) pressure += 1;
     if (thirstyPlants >= 2) pressure += 1;
-    if (goal === "onderhoudsarm") pressure -= 1;
+    if (profile.greenLevel === "Veel bestrating") pressure += 1;
+    if (profile.sunProfile === "Veel schaduw") pressure -= 1;
+    if (profile.goal === "Minder onderhoud") pressure -= 1;
 
     const advies: "geen water nodig" | "licht water geven" | "extra water geven" = pressure >= 5 ? "extra water geven" : pressure >= 3 ? "licht water geven" : "geen water nodig";
     return {
@@ -668,17 +732,21 @@ function createDailyWaterAdvice(selectedPlants: Array<{ basePlant: string; plant
   });
 }
 
-function createEnvironmentContext(location: { label: string; lat: number; lon: number } | null, selectedPlants: Array<{ basePlant: string; plantName: string }>, goal: string) {
+function createEnvironmentContext(location: { label: string; lat: number; lon: number } | null, selectedPlants: Array<{ basePlant: string; plantName: string }>, profile: GardenProfile) {
   const hasUrbanPlants = selectedPlants.some((plant) => ["Buxus", "Beukenhaag", "Klimop"].includes(plant.basePlant));
-  const type: "stedelijke tuin" | "groene omgeving" | "gemengd" = location && isLikelyUrban(location.label) ? "stedelijke tuin" : goal === "biodivers" ? "groene omgeving" : "gemengd";
+  const type: "stedelijke tuin" | "groene omgeving" | "gemengd" = location && isLikelyUrban(location.label)
+    ? "stedelijke tuin"
+    : profile.greenLevel === "Vooral groen" || profile.goal === "Meer biodiversiteit"
+      ? "groene omgeving"
+      : "gemengd";
   const perceelgevoel = type === "stedelijke tuin"
-    ? "Stenen en schuttingen houden warmte langer vast."
+    ? "Stenen, muren en schuttingen houden warmte langer vast."
     : type === "groene omgeving"
       ? "Groene randen zorgen vaker voor koelere avonden."
       : "Een mix van beschutting, border en verharding.";
   const nabijheid = hasUrbanPlants
     ? "Haag en klimmers geven beschutting en privacy."
-    : goal === "biodivers"
+    : profile.goal === "Meer biodiversiteit"
       ? "Bloei en schuilplekken maken de tuin aantrekkelijker voor bestuivers."
       : "De directe omgeving voelt bruikbaar voor een evenwichtige tuin.";
 
@@ -688,6 +756,33 @@ function createEnvironmentContext(location: { label: string; lat: number; lon: n
     nabijheid,
     kaartUrl: location ? createOsmTileUrl(location.lat, location.lon) : undefined
   };
+}
+
+function getProfileDryness(profile: GardenProfile, weather: ReturnType<typeof getWeatherProfile>): "laag" | "gemiddeld" | "hoog" {
+  let score = weather.dryRisk === "hoog" ? 3 : weather.dryRisk === "middel" ? 2 : 1;
+  if (profile.greenLevel === "Veel bestrating") score += 1;
+  if (profile.sunProfile === "Vooral middagzon") score += 1;
+  if (profile.sunProfile === "Veel schaduw") score -= 1;
+  return score >= 4 ? "hoog" : score >= 2 ? "gemiddeld" : "laag";
+}
+
+function createGardenDna(
+  profile: GardenProfile,
+  selectedPlants: Array<{ basePlant: string; plantName: string }>,
+  weather: ReturnType<typeof getWeatherProfile>,
+  biodiversityScore: number,
+  bloomSoon: string[]
+) {
+  const dryness = getProfileDryness(profile, weather);
+  const hasMediterraneanPlants = selectedPlants.some((plant) => ["Lavendel", "Siergras", "Roos"].includes(plant.basePlant));
+  const bloomPotential = bloomSoon[0] && bloomSoon[0] !== "Nog geen duidelijke bloeiers" ? "Veel seizoensbloei in aantocht" : "Rustige bloeifase deze maand";
+  return [
+    `${profile.gardenType}`,
+    `${profile.sunProfile} met ${profile.greenLevel.toLowerCase()}`,
+    dryness === "hoog" ? "Droogtegevoelig deze week" : dryness === "gemiddeld" ? "Gemiddeld droogtegevoelig" : "Koeler en minder dorstig",
+    biodiversityScore >= 70 || profile.goal === "Meer biodiversiteit" ? "Sterke basis voor biodiversiteit" : "Biodiversiteit kan nog groeien",
+    hasMediterraneanPlants || profile.goal === "Mediterrane uitstraling" ? "Mediterrane accenten passen goed" : bloomPotential
+  ];
 }
 
 function isLikelyUrban(label: string) {

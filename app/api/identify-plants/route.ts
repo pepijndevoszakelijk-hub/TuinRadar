@@ -20,35 +20,43 @@ type PlantNetResponse = {
 };
 
 export async function POST(request: Request) {
-  const apiKey = process.env.PLANTNET_API_KEY?.trim();
-  const formData = await request.formData();
-  const files = formData.getAll("plantPhotos").filter(isFile).slice(0, 7);
+  try {
+    const apiKey = process.env.PLANTNET_API_KEY?.trim();
+    const formData = await request.formData();
+    const files = formData.getAll("plantPhotos").filter(isFile).slice(0, 7);
 
-  if (!files.length) {
-    return NextResponse.json({ error: "Geen plantfoto's ontvangen." }, { status: 400 });
-  }
+    if (!files.length) {
+      return NextResponse.json({ error: "Geen plantfoto's ontvangen." }, { status: 400 });
+    }
 
-  if (!apiKey) {
+    if (!apiKey) {
+      return NextResponse.json({
+        beschikbaar: false,
+        melding: "Automatische herkenning is niet beschikbaar. Kies de plantnaam zelf.",
+        resultaten: files.map((_, fotoIndex) => ({
+          fotoIndex,
+          suggesties: [],
+          foutmelding: "Automatische herkenning is niet beschikbaar."
+        }))
+      });
+    }
+
+    const resultaten = await Promise.all(files.map((file, fotoIndex) => identifyPlant(file, fotoIndex, apiKey)));
+
+    return NextResponse.json({
+      beschikbaar: true,
+      melding: resultaten.some((item) => item.foutmelding)
+        ? "Sommige foto's konden niet automatisch worden herkend. Controleer de plantnaam."
+        : "Automatische herkenning voltooid.",
+      resultaten
+    });
+  } catch {
     return NextResponse.json({
       beschikbaar: false,
-      melding: "Automatische herkenning niet beschikbaar. Kies zelf de plantnaam.",
-      resultaten: files.map((_, fotoIndex) => ({
-        fotoIndex,
-        suggesties: [],
-        foutmelding: "PLANTNET_API_KEY ontbreekt."
-      }))
+      melding: "Automatische herkenning is tijdelijk niet beschikbaar. Kies de plantnaam zelf.",
+      resultaten: []
     });
   }
-
-  const resultaten = await Promise.all(files.map((file, fotoIndex) => identifyPlant(file, fotoIndex, apiKey)));
-
-  return NextResponse.json({
-    beschikbaar: true,
-    melding: resultaten.some((item) => item.foutmelding)
-      ? "Sommige foto's konden niet automatisch worden herkend. Controleer de plantnaam."
-      : "Automatische herkenning voltooid.",
-    resultaten
-  });
 }
 
 function isFile(value: FormDataEntryValue): value is File {
@@ -76,7 +84,16 @@ async function identifyPlant(file: File, fotoIndex: number, apiKey: string): Pro
       return {
         fotoIndex,
         suggesties: [],
-        foutmelding: `Pl@ntNet gaf HTTP ${response.status}.`
+        foutmelding: "Automatische herkenning lukte niet voor deze foto."
+      };
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/json")) {
+      return {
+        fotoIndex,
+        suggesties: [],
+        foutmelding: "Automatische herkenning lukte niet voor deze foto."
       };
     }
 
@@ -88,11 +105,11 @@ async function identifyPlant(file: File, fotoIndex: number, apiKey: string): Pro
       suggesties,
       foutmelding: suggesties.length ? undefined : "Geen betrouwbare suggesties gevonden."
     };
-  } catch (error) {
+  } catch {
     return {
       fotoIndex,
       suggesties: [],
-      foutmelding: error instanceof Error ? error.message : "Pl@ntNet-herkenning mislukt."
+      foutmelding: "Automatische herkenning lukte niet voor deze foto."
     };
   }
 }
